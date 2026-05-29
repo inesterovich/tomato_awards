@@ -1,24 +1,66 @@
 const fs = require('fs');
 const path = require('path');
-const {
-    buildSurnameMap,
-    normalizePair
-} = require('./pairNormalizer.js');
+const { buildSurnameMap, normalizePair } = require('./pairNormalizer.js');
 
 const OUTPUT_BASE = './output';
 
 function processNomination(nominationPath, nominationName) {
     const pairsFile = path.join(nominationPath, 'votes_with_pairs.json');
+    const synonymsFile = path.join(nominationPath, 'synonyms.json');
+    const uniquePairsFile = path.join(nominationPath, 'unique_pairs.json');
+
     if (!fs.existsSync(pairsFile)) {
         console.log(`  ${nominationName}: votes_with_pairs.json не найден, пропускаем`);
         return;
     }
+    if (!fs.existsSync(synonymsFile)) {
+        console.error(`  ${nominationName}: Файл synonyms.json не найден. Сначала создайте его вручную на основе unique_pairs.json`);
+        return;
+    }
+    if (!fs.existsSync(uniquePairsFile)) {
+        console.error(`  ${nominationName}: unique_pairs.json не найден. Сначала запустите extractUniquePairs.js`);
+        return;
+    }
 
     const votesData = JSON.parse(fs.readFileSync(pairsFile, 'utf8'));
+    const synonyms = JSON.parse(fs.readFileSync(synonymsFile, 'utf8'));
+    const uniquePairs = JSON.parse(fs.readFileSync(uniquePairsFile, 'utf8'));
+
+    // Строим карту вариант → каноническая пара (включая сам canonical)
+    const variantToCanonical = new Map();
+    for (const group of synonyms) {
+        if (!group.canonical || !group.variants || !Array.isArray(group.variants)) {
+            console.error(`  ${nominationName}: Некорректная запись в synonyms.json:`, group);
+            process.exit(1);
+        }
+        variantToCanonical.set(group.canonical, group.canonical);
+        for (const variant of group.variants) {
+            if (variantToCanonical.has(variant)) {
+                console.warn(`  ${nominationName}: Вариант "${variant}" приписан к нескольким каноническим парам. Будет использован первый.`);
+                continue;
+            }
+            variantToCanonical.set(variant, group.canonical);
+        }
+    }
+
+    // Проверка покрытия: каждый canonical из unique_pairs.json должен присутствовать как вариант или как canonical
+    const uncovered = [];
+    for (const item of uniquePairs) {
+        const canonicalFromFile = item.canonical;
+        if (!variantToCanonical.has(canonicalFromFile)) {
+            uncovered.push(canonicalFromFile);
+        }
+    }
+    if (uncovered.length > 0) {
+        const outUncovered = path.join(nominationPath, 'uncovered_variants.json');
+        fs.writeFileSync(outUncovered, JSON.stringify(uncovered, null, 2), 'utf8');
+        console.error(`  ${nominationName}: ❌ Найдено ${uncovered.length} вариантов из unique_pairs.json, которые не покрыты synonyms.json.`);
+        console.error(`     Сохранено в ${outUncovered}. Добавьте их в synonyms.json (как канонические или варианты).`);
+        return;
+    }
+
+    // Строим карту фамилий (для нормализации)
     const surnameMap = buildSurnameMap(votesData);
-    fs.writeFileSync(path.join(nominationPath, 'surname_map.json'), JSON.stringify(
-        Object.fromEntries([...surnameMap.entries()].map(([k, v]) => [k, { mostFrequent: v.mostFrequent, variants: [...v.variants.keys()] }])),
-        null, 2), 'utf8');
 
     // Группировка голосов по пользователям
     const userVotesMap = new Map();
@@ -28,7 +70,12 @@ function processNomination(nominationPath, nominationName) {
         const timestamp = vote.timestamp;
         const originalText = vote.originalText;
         for (const p of vote.pairs) {
-            const canonical = normalizePair(p.pairLeft, p.pairRight, surnameMap);
+            const normalized = normalizePair(p.pairLeft, p.pairRight, surnameMap);
+            const canonical = variantToCanonical.get(normalized);
+            if (!canonical) {
+                console.warn(`  ${nominationName}: Вариант "${normalized}" не найден в synonyms.json. Пропускаем.`);
+                continue;
+            }
             if (!userVotesMap.has(userId)) userVotesMap.set(userId, []);
             userVotesMap.get(userId).push({
                 canonical,
@@ -41,7 +88,7 @@ function processNomination(nominationPath, nominationName) {
         }
     }
 
-    // Лимит 3 голоса на пользователя (по времени)
+    // Лимит 3 голоса на пользователя
     const allVotes = [];
     for (const [userId, items] of userVotesMap.entries()) {
         items.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
@@ -51,12 +98,12 @@ function processNomination(nominationPath, nominationName) {
         for (const item of uncounted) allVotes.push({ ...item, counted: false });
     }
 
-    // Агрегация по нормализованным парам
+    // Агрегация по каноническим парам
     const pairStats = new Map();
     for (const vote of allVotes) {
-        const pair = vote.canonical;
-        if (!pairStats.has(pair)) pairStats.set(pair, { votes: [], uncounted: [] });
-        const entry = pairStats.get(pair);
+        const canonical = vote.canonical;
+        if (!pairStats.has(canonical)) pairStats.set(canonical, { votes: [], uncounted: [] });
+        const entry = pairStats.get(canonical);
         const voteInfo = {
             userId: vote.userId,
             username: vote.username,
@@ -87,17 +134,12 @@ function processNomination(nominationPath, nominationName) {
         pairs: results
     }, null, 2), 'utf8');
 
-    const uniquePairsList = Array.from(pairStats.keys()).sort();
-    const outPairsList = path.join(nominationPath, 'votes_pairs_list.json');
-    fs.writeFileSync(outPairsList, JSON.stringify(uniquePairsList, null, 2), 'utf8');
-
     console.log(`  ${nominationName}:`);
     console.log(`    Уникальных пользователей: ${userVotesMap.size}`);
-    console.log(`    Всего голосов (до фильтрации): ${allVotes.length}`);
+    console.log(`    Всего голосов (после маппинга): ${allVotes.length}`);
     console.log(`    Зачтено: ${allVotes.filter(v => v.counted).length}, отклонено (лимит 3): ${allVotes.filter(v => !v.counted).length}`);
     console.log(`    Уникальных пар: ${results.length}`);
     console.log(`    Результат сохранён в ${outFile}`);
-    console.log(`    Список пар: ${outPairsList}`);
 }
 
 function main() {
@@ -105,17 +147,14 @@ function main() {
         console.error(`Папка ${OUTPUT_BASE} не существует. Сначала запустите parseVotes.js и extractPairs.js`);
         process.exit(1);
     }
-
     const nominations = fs.readdirSync(OUTPUT_BASE).filter(item => {
         const itemPath = path.join(OUTPUT_BASE, item);
         return fs.statSync(itemPath).isDirectory();
     });
-
     if (nominations.length === 0) {
         console.log(`Нет папок номинаций в ${OUTPUT_BASE}`);
         return;
     }
-
     console.log(`Найдено номинаций: ${nominations.length}\n`);
     for (const nom of nominations) {
         const nomPath = path.join(OUTPUT_BASE, nom);

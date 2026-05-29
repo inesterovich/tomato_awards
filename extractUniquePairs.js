@@ -1,83 +1,11 @@
 const fs = require('fs');
 const path = require('path');
+const {
+    buildSurnameMap,
+    normalizePair
+} = require('./pairNormalizer.js');
 
 const OUTPUT_BASE = './output';
-
-// ---------- Функции нормализации (идентичны тем, что в countVotes) ----------
-function extractFullNames(text) {
-    if (!text || typeof text !== 'string') return new Set();
-    const pattern = /([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+)/g;
-    const names = new Set();
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-        names.add(`${match[1]} ${match[2]}`);
-        names.add(`${match[2]} ${match[1]}`);
-    }
-    return names;
-}
-
-function buildSurnameMap(votesData) {
-    const surnameStats = new Map();
-    const updateStats = (fullName) => {
-        const words = fullName.split(' ');
-        if (words.length < 2) return;
-        const surname = words[words.length - 1].toLowerCase();
-        if (!surnameStats.has(surname)) {
-            surnameStats.set(surname, { count: 0, fullName: fullName });
-        }
-        const entry = surnameStats.get(surname);
-        entry.count++;
-        if (entry.count > (surnameStats.get(surname).count || 0)) {
-            entry.fullName = fullName;
-        }
-    };
-    for (const vote of votesData) {
-        if (vote.originalText) {
-            const names = extractFullNames(vote.originalText);
-            for (const fullName of names) updateStats(fullName);
-        }
-        if (vote.pairs && Array.isArray(vote.pairs)) {
-            for (const p of vote.pairs) {
-                if (p.pairLeft && typeof p.pairLeft === 'string') {
-                    const names = extractFullNames(p.pairLeft);
-                    for (const fullName of names) updateStats(fullName);
-                }
-                if (p.pairRight && typeof p.pairRight === 'string') {
-                    const names = extractFullNames(p.pairRight);
-                    for (const fullName of names) updateStats(fullName);
-                }
-            }
-        }
-    }
-    return surnameStats;
-}
-
-function normalizeSide(side, surnameMap) {
-    const trimmed = side.trim();
-    const words = trimmed.split(/\s+/);
-    if (words.length === 1) {
-        const lower = words[0].toLowerCase();
-        if (surnameMap.has(lower)) return surnameMap.get(lower).fullName;
-        return trimmed;
-    } else {
-        const lastWord = words[words.length - 1].toLowerCase();
-        if (surnameMap.has(lastWord)) return surnameMap.get(lastWord).fullName;
-        const firstWord = words[0].toLowerCase();
-        if (surnameMap.has(firstWord)) return surnameMap.get(firstWord).fullName;
-        return trimmed;
-    }
-}
-
-function normalizePair(pairLeft, pairRight, surnameMap) {
-    let leftNorm = normalizeSide(pairLeft, surnameMap);
-    let rightNorm = normalizeSide(pairRight, surnameMap);
-    const getSurname = (name) => name.split(' ').pop().toLowerCase();
-    if (getSurname(leftNorm) > getSurname(rightNorm)) {
-        [leftNorm, rightNorm] = [rightNorm, leftNorm];
-    }
-    return `${leftNorm} - ${rightNorm}`;
-}
-// -----------------------------------------------------------------
 
 function processNomination(nominationPath, nominationName) {
     const pairsFile = path.join(nominationPath, 'votes_with_pairs.json');
@@ -88,8 +16,9 @@ function processNomination(nominationPath, nominationName) {
 
     const votesData = JSON.parse(fs.readFileSync(pairsFile, 'utf8'));
     const surnameMap = buildSurnameMap(votesData);
-    // сохраняем карту для справки (необязательно)
-    fs.writeFileSync(path.join(nominationPath, 'surname_map.json'), JSON.stringify(Object.fromEntries(surnameMap), null, 2), 'utf8');
+    fs.writeFileSync(path.join(nominationPath, 'surname_map.json'), JSON.stringify(
+        Object.fromEntries([...surnameMap.entries()].map(([k, v]) => [k, { mostFrequent: v.mostFrequent, variants: [...v.variants.keys()] }])),
+        null, 2), 'utf8');
 
     const uniquePairsSet = new Set();
     for (const vote of votesData) {

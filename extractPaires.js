@@ -1,103 +1,21 @@
 const fs = require('fs');
 const path = require('path');
+const {
+    buildSurnameMap,
+    splitIntoStatements,
+    extractAllPairsFromStatement
+} = require('./pairNormalizer.js');
 
 const OUTPUT_BASE = './output';
-const DASH_PATTERN = '[–—-]';
 const ALLOWED_MANUAL_FLAGS = ['cleanedText', 'noPairs', 'notPairs'];
 
 // ------------------------------------------------------------------
-// 1. Предобработка текста (нормализация ё, склейка -\n, удаление тегов)
+// Парсинг без ручного файла
 // ------------------------------------------------------------------
-function preprocessText(text) {
-    let processed = text.replace(/ë/g, 'ё').replace(/Ë/g, 'Ё');
-    processed = processed.replace(/([-–—])\n/g, '$1');
-    processed = processed.replace(/\[id\d+\|([^\]]+)\]/g, '$1');
-    processed = processed.replace(/@([А-ЯЁа-яё]+)/g, '$1');
-    processed = processed.replace(/[ \t]+/g, ' ').trim();
-    return processed;
-}
-
-// ------------------------------------------------------------------
-// 2. Разбиение на высказывания (сохраняем переносы строк)
-// ------------------------------------------------------------------
-function splitIntoStatements(text) {
-    const normalized = preprocessText(text);
-    let lines = normalized.split(/\n/);
-    let result = [];
-    for (let line of lines) {
-        line = line.trim();
-        if (line === '') continue;
-        let subParts = line.split(/\d+[\.\)]\s*/);
-        for (let sub of subParts) {
-            sub = sub.trim();
-            if (sub) result.push(sub);
-        }
-    }
-    if (result.length === 0) result = [normalized];
-    return result;
-}
-
-// ------------------------------------------------------------------
-// 3. Извлечение пар из одного высказывания (со стоп-словами)
-// ------------------------------------------------------------------
-function extractAllPairsFromStatement(statement) {
-    const pairs = [];
-    const stopWords = [
-        'командное', 'первенство', 'чемпионат', 'россии', 'года',
-        'конкурс', 'турнир', 'номер', 'рутина', 'танец', 'выступление', 'номинация'
-    ];
-
-    // 1. Полные имена через тире
-    const fullPattern = new RegExp(`([А-ЯЁ][а-яё]+(?:ё)?\\s+[А-ЯЁ][а-яё]+(?:ё)?)\\s*${DASH_PATTERN}\\s*([А-ЯЁ][а-яё]+(?:ё)?\\s+[А-ЯЁ][а-яё]+(?:ё)?)`, 'g');
-    let match;
-    while ((match = fullPattern.exec(statement)) !== null) {
-        pairs.push({ pairRaw: `${match[1]} - ${match[2]}`, pairLeft: match[1], pairRight: match[2] });
-    }
-    if (pairs.length) return pairs;
-
-    // 2. Только фамилии через тире
-    const shortPattern = new RegExp(`([А-ЯЁ][а-яё]+(?:ё)?)\\s*${DASH_PATTERN}\\s*([А-ЯЁ][а-яё]+(?:ё)?)`, 'g');
-    while ((match = shortPattern.exec(statement)) !== null) {
-        pairs.push({ pairRaw: `${match[1]} - ${match[2]}`, pairLeft: match[1], pairRight: match[2] });
-    }
-    if (pairs.length) return pairs;
-
-    // 3. Два полных имени подряд (без разделителя) – с проверкой на стоп-слова
-    const twoFullNamesPattern = /([А-ЯЁ][а-яё]+(?:ё)?\s+[А-ЯЁ][а-яё]+(?:ё)?)\s+([А-ЯЁ][а-яё]+(?:ё)?\s+[А-ЯЁ][а-яё]+(?:ё)?)/g;
-    while ((match = twoFullNamesPattern.exec(statement)) !== null) {
-        const name1 = match[1];
-        const name2 = match[2];
-        const allWords = name1.split(' ').concat(name2.split(' ')).map(w => w.toLowerCase());
-        if (allWords.some(w => stopWords.includes(w))) continue;
-        pairs.push({ pairRaw: `${name1} - ${name2}`, pairLeft: name1, pairRight: name2 });
-    }
-    if (pairs.length) return pairs;
-
-    // 4. VK-теги (запасной вариант, обычно уже заменены)
-    const vkTagPattern = /\[id\d+\|([^\]]+)\]\s*[-–]\s*\[id\d+\|([^\]]+)\]/g;
-    while ((match = vkTagPattern.exec(statement)) !== null) {
-        pairs.push({ pairRaw: `${match[1]} - ${match[2]}`, pairLeft: match[1].trim(), pairRight: match[2].trim() });
-    }
-    if (pairs.length) return pairs;
-
-    // 5. Разделители "и", "с", "&", "+", "/"
-    const separators = ['\\s+и\\s+', '\\s+с\\s+', '\\s*&\\s*', '\\s*\\+\\s*', '\\s*/\\s*'];
-    for (const sep of separators) {
-        const pattern = new RegExp(`([А-ЯЁ][а-яё]+(?:ё)?(?:\\s+[А-ЯЁ][а-яё]+(?:ё)?)?)\\s*${sep}\\s*([А-ЯЁ][а-яё]+(?:ё)?(?:\\s+[А-ЯЁ][а-яё]+(?:ё)?)?)`, 'g');
-        while ((match = pattern.exec(statement)) !== null) {
-            pairs.push({ pairRaw: `${match[1]} - ${match[2]}`, pairLeft: match[1], pairRight: match[2] });
-        }
-        if (pairs.length) return pairs;
-    }
-    return pairs;
-}
-
-// ------------------------------------------------------------------
-// 4. Парсинг без ручного файла
-// ------------------------------------------------------------------
-function parseVotes(votes) {
+function parseVotes(votes, surnameMap) {
     const recognized = [];
     const unrecognized = [];
+
     for (const vote of votes) {
         const textForParsing = vote.cleanedText || vote.text;
         const statements = splitIntoStatements(textForParsing);
@@ -137,7 +55,7 @@ function parseVotes(votes) {
 }
 
 // ------------------------------------------------------------------
-// 5. Валидация ручного файла (с поддержкой notPairs)
+// Валидация ручного файла
 // ------------------------------------------------------------------
 function validateManualFile(manualData, originalVotes, prevUnrecognized) {
     const manualFixed = manualData.filter(item => item.withManual && ALLOWED_MANUAL_FLAGS.includes(item.withManual));
@@ -166,10 +84,8 @@ function validateManualFile(manualData, originalVotes, prevUnrecognized) {
             console.error(`\n📝 Изменены защищённые поля у комментария ${manual.username}. Только cleanedText можно менять (или ставить флаг noPairs). Не жульничайте! 😼`);
             return false;
         }
-        // Для флагов notPairs/noPairs дополнительные проверки не нужны
     }
 
-    // Проверяем "хорошие" комментарии (без флага)
     const goodManual = manualData.filter(v => !v.withManual);
     const goodOriginal = originalVotes.filter(v => {
         return !prevUnrecognized.some(u => u.userId === v.userId && u.timestamp === v.timestamp);
@@ -198,7 +114,7 @@ function validateManualFile(manualData, originalVotes, prevUnrecognized) {
 }
 
 // ------------------------------------------------------------------
-// 6. Основная обработка номинации (с историей и флагом notPairs)
+// Основная обработка номинации
 // ------------------------------------------------------------------
 function processNomination(nominationPath, nominationName) {
     const votesFile = path.join(nominationPath, 'votes.json');
@@ -212,11 +128,16 @@ function processNomination(nominationPath, nominationName) {
     }
 
     const originalVotes = JSON.parse(fs.readFileSync(votesFile, 'utf8'));
+    const surnameMap = buildSurnameMap(originalVotes);
+    // сохраняем карту для отладки
+    fs.writeFileSync(path.join(nominationPath, 'surname_map.json'), JSON.stringify(
+        Object.fromEntries([...surnameMap.entries()].map(([k, v]) => [k, { mostFrequent: v.mostFrequent, variants: [...v.variants.keys()] }])),
+        null, 2), 'utf8');
 
-    // --- Ручной файл отсутствует ---
+    // --- Режим без ручного файла ---
     if (!fs.existsSync(manualFile)) {
         console.log(`  ${nominationName}: 🤖 Ручного файла нет. Запускаю автоматическое распознавание...`);
-        const { recognized, unrecognized } = parseVotes(originalVotes);
+        const { recognized, unrecognized } = parseVotes(originalVotes, surnameMap);
         fs.writeFileSync(path.join(nominationPath, 'votes_with_pairs.json'), JSON.stringify(recognized, null, 2), 'utf8');
         fs.writeFileSync(unrecognizedFile, JSON.stringify(unrecognized, null, 2), 'utf8');
 
@@ -251,7 +172,7 @@ function processNomination(nominationPath, nominationName) {
 
     console.log(`  ✅ Валидация успешна! Запускаю распознавание с учётом ваших правок.`);
 
-    // Подготовка данных для парсинга (для notPairs текст не важен)
+    // Подготовка данных (для notPairs текст не важен)
     const votesToParse = manualData.map(v => {
         if (v.withManual === 'cleanedText') {
             return { ...v, textForParsing: v.cleanedText };
@@ -264,7 +185,6 @@ function processNomination(nominationPath, nominationName) {
     const unrecognizedOut = [];
 
     for (const vote of votesToParse) {
-        // Пропускаем помеченные notPairs / noPairs
         if (vote.withManual === 'notPairs' || vote.withManual === 'noPairs') {
             continue;
         }
@@ -307,7 +227,7 @@ function processNomination(nominationPath, nominationName) {
     fs.writeFileSync(path.join(nominationPath, 'votes_with_pairs.json'), JSON.stringify(recognized, null, 2), 'utf8');
     fs.writeFileSync(unrecognizedFile, JSON.stringify(unrecognizedOut, null, 2), 'utf8');
 
-    // --- Сохранение истории и лога решённых записей ---
+    // --- Сохранение истории и лога решённых ---
     if (!fs.existsSync(historyDir)) fs.mkdirSync(historyDir, { recursive: true });
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const historyFile = path.join(historyDir, `unrecognized_${timestamp}.json`);
@@ -343,7 +263,7 @@ function processNomination(nominationPath, nominationName) {
 }
 
 // ------------------------------------------------------------------
-// 7. Главная функция
+// Главная функция
 // ------------------------------------------------------------------
 function main() {
     if (!fs.existsSync(OUTPUT_BASE)) {
