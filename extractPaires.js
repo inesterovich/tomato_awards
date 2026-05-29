@@ -3,10 +3,11 @@ const path = require('path');
 
 const OUTPUT_BASE = './output';
 const DASH_PATTERN = '[–—-]';
+const ALLOWED_MANUAL_FLAGS = ['cleanedText', 'noPairs', 'notPairs'];
 
-// --------------------------------------------------------------
-// Вспомогательные функции
-// --------------------------------------------------------------
+// ------------------------------------------------------------------
+// 1. Предобработка текста (нормализация ё, склейка -\n, удаление тегов)
+// ------------------------------------------------------------------
 function preprocessText(text) {
     let processed = text.replace(/ë/g, 'ё').replace(/Ë/g, 'Ё');
     processed = processed.replace(/([-–—])\n/g, '$1');
@@ -16,25 +17,37 @@ function preprocessText(text) {
     return processed;
 }
 
+// ------------------------------------------------------------------
+// 2. Разбиение на высказывания (сохраняем переносы строк)
+// ------------------------------------------------------------------
 function splitIntoStatements(text) {
     const normalized = preprocessText(text);
-    const lines = normalized.split(/\n/);
-    const result = [];
+    let lines = normalized.split(/\n/);
+    let result = [];
     for (let line of lines) {
         line = line.trim();
         if (line === '') continue;
-        const subParts = line.split(/\d+[\.\)]\s*/);
+        let subParts = line.split(/\d+[\.\)]\s*/);
         for (let sub of subParts) {
             sub = sub.trim();
             if (sub) result.push(sub);
         }
     }
-    if (result.length === 0) result.push(normalized);
+    if (result.length === 0) result = [normalized];
     return result;
 }
 
+// ------------------------------------------------------------------
+// 3. Извлечение пар из одного высказывания (со стоп-словами)
+// ------------------------------------------------------------------
 function extractAllPairsFromStatement(statement) {
     const pairs = [];
+    const stopWords = [
+        'командное', 'первенство', 'чемпионат', 'россии', 'года',
+        'конкурс', 'турнир', 'номер', 'рутина', 'танец', 'выступление', 'номинация'
+    ];
+
+    // 1. Полные имена через тире
     const fullPattern = new RegExp(`([А-ЯЁ][а-яё]+(?:ё)?\\s+[А-ЯЁ][а-яё]+(?:ё)?)\\s*${DASH_PATTERN}\\s*([А-ЯЁ][а-яё]+(?:ё)?\\s+[А-ЯЁ][а-яё]+(?:ё)?)`, 'g');
     let match;
     while ((match = fullPattern.exec(statement)) !== null) {
@@ -42,18 +55,32 @@ function extractAllPairsFromStatement(statement) {
     }
     if (pairs.length) return pairs;
 
+    // 2. Только фамилии через тире
     const shortPattern = new RegExp(`([А-ЯЁ][а-яё]+(?:ё)?)\\s*${DASH_PATTERN}\\s*([А-ЯЁ][а-яё]+(?:ё)?)`, 'g');
     while ((match = shortPattern.exec(statement)) !== null) {
         pairs.push({ pairRaw: `${match[1]} - ${match[2]}`, pairLeft: match[1], pairRight: match[2] });
     }
     if (pairs.length) return pairs;
 
+    // 3. Два полных имени подряд (без разделителя) – с проверкой на стоп-слова
     const twoFullNamesPattern = /([А-ЯЁ][а-яё]+(?:ё)?\s+[А-ЯЁ][а-яё]+(?:ё)?)\s+([А-ЯЁ][а-яё]+(?:ё)?\s+[А-ЯЁ][а-яё]+(?:ё)?)/g;
     while ((match = twoFullNamesPattern.exec(statement)) !== null) {
-        pairs.push({ pairRaw: `${match[1]} - ${match[2]}`, pairLeft: match[1], pairRight: match[2] });
+        const name1 = match[1];
+        const name2 = match[2];
+        const allWords = name1.split(' ').concat(name2.split(' ')).map(w => w.toLowerCase());
+        if (allWords.some(w => stopWords.includes(w))) continue;
+        pairs.push({ pairRaw: `${name1} - ${name2}`, pairLeft: name1, pairRight: name2 });
     }
     if (pairs.length) return pairs;
 
+    // 4. VK-теги (запасной вариант, обычно уже заменены)
+    const vkTagPattern = /\[id\d+\|([^\]]+)\]\s*[-–]\s*\[id\d+\|([^\]]+)\]/g;
+    while ((match = vkTagPattern.exec(statement)) !== null) {
+        pairs.push({ pairRaw: `${match[1]} - ${match[2]}`, pairLeft: match[1].trim(), pairRight: match[2].trim() });
+    }
+    if (pairs.length) return pairs;
+
+    // 5. Разделители "и", "с", "&", "+", "/"
     const separators = ['\\s+и\\s+', '\\s+с\\s+', '\\s*&\\s*', '\\s*\\+\\s*', '\\s*/\\s*'];
     for (const sep of separators) {
         const pattern = new RegExp(`([А-ЯЁ][а-яё]+(?:ё)?(?:\\s+[А-ЯЁ][а-яё]+(?:ё)?)?)\\s*${sep}\\s*([А-ЯЁ][а-яё]+(?:ё)?(?:\\s+[А-ЯЁ][а-яё]+(?:ё)?)?)`, 'g');
@@ -65,9 +92,9 @@ function extractAllPairsFromStatement(statement) {
     return pairs;
 }
 
-// --------------------------------------------------------------
-// Парсинг без ручного файла (возвращает recognized и unrecognized)
-// --------------------------------------------------------------
+// ------------------------------------------------------------------
+// 4. Парсинг без ручного файла
+// ------------------------------------------------------------------
 function parseVotes(votes) {
     const recognized = [];
     const unrecognized = [];
@@ -109,14 +136,10 @@ function parseVotes(votes) {
     return { recognized, unrecognized };
 }
 
-// --------------------------------------------------------------
-// Валидация ручного файла (с юмором и строгой проверкой cleanedText)
-// --------------------------------------------------------------
-// Допустимые флаги
-const ALLOWED_MANUAL_FLAGS = ['cleanedText', 'noPairs', 'notPairs']; // notPairs - синоним
-
+// ------------------------------------------------------------------
+// 5. Валидация ручного файла (с поддержкой notPairs)
+// ------------------------------------------------------------------
 function validateManualFile(manualData, originalVotes, prevUnrecognized) {
-    // 1) Проверяем, что записи с флагами (cleanedText или noPairs) соответствуют prevUnrecognized
     const manualFixed = manualData.filter(item => item.withManual && ALLOWED_MANUAL_FLAGS.includes(item.withManual));
     if (manualFixed.length !== prevUnrecognized.length) {
         console.error(`\n😈 Ой-ой-ой! Вы отметили ${manualFixed.length} комментариев как "ручные", но нераспознанных было ${prevUnrecognized.length}. Либо вы ошиблись, либо намухлевали. 🚫`);
@@ -139,15 +162,14 @@ function validateManualFile(manualData, originalVotes, prevUnrecognized) {
         if (original.userId !== manual.userId ||
             original.username !== manual.username ||
             original.timestamp !== manual.timestamp ||
-            original.originalText !== manual.text) { // в ручном файле поле text, а не originalText? надо унифицировать
+            original.originalText !== manual.text) {
             console.error(`\n📝 Изменены защищённые поля у комментария ${manual.username}. Только cleanedText можно менять (или ставить флаг noPairs). Не жульничайте! 😼`);
             return false;
         }
-        // Если флаг "cleanedText" — cleanedText может быть изменён (но не обязан). Если "noPairs" — cleanedText может быть любым (даже не меняться).
-        // Дополнительных проверок не нужно.
+        // Для флагов notPairs/noPairs дополнительные проверки не нужны
     }
 
-    // 2) Проверяем "хорошие" комментарии (без флага) — они должны совпадать с originalVotes, исключая нераспознанные
+    // Проверяем "хорошие" комментарии (без флага)
     const goodManual = manualData.filter(v => !v.withManual);
     const goodOriginal = originalVotes.filter(v => {
         return !prevUnrecognized.some(u => u.userId === v.userId && u.timestamp === v.timestamp);
@@ -167,7 +189,6 @@ function validateManualFile(manualData, originalVotes, prevUnrecognized) {
             console.error(`\n⚠️ У комментария ${orig.username} от ${orig.timestamp} изменены защищённые поля. Нечестно! 🦹`);
             return false;
         }
-        // Проверяем cleanedText: оно должно совпадать, если есть в оригинале
         if (orig.cleanedText !== man.cleanedText) {
             console.error(`\n✂️ Вы изменили cleanedText у успешно распознанного комментария. Это подозрительно! 🤡`);
             return false;
@@ -176,13 +197,14 @@ function validateManualFile(manualData, originalVotes, prevUnrecognized) {
     return true;
 }
 
-// --------------------------------------------------------------
-// Основная обработка номинации
-// --------------------------------------------------------------
+// ------------------------------------------------------------------
+// 6. Основная обработка номинации (с историей и флагом notPairs)
+// ------------------------------------------------------------------
 function processNomination(nominationPath, nominationName) {
     const votesFile = path.join(nominationPath, 'votes.json');
     const unrecognizedFile = path.join(nominationPath, 'votes_unrecognized.json');
     const manualFile = path.join(nominationPath, 'votes_with_manual.json');
+    const historyDir = path.join(nominationPath, 'history');
 
     if (!fs.existsSync(votesFile)) {
         console.log(`  ${nominationName}: votes.json не найден, пропускаем`);
@@ -191,43 +213,50 @@ function processNomination(nominationPath, nominationName) {
 
     const originalVotes = JSON.parse(fs.readFileSync(votesFile, 'utf8'));
 
-    // Если нет ручного файла – обычный режим
+    // --- Ручной файл отсутствует ---
     if (!fs.existsSync(manualFile)) {
         console.log(`  ${nominationName}: 🤖 Ручного файла нет. Запускаю автоматическое распознавание...`);
         const { recognized, unrecognized } = parseVotes(originalVotes);
         fs.writeFileSync(path.join(nominationPath, 'votes_with_pairs.json'), JSON.stringify(recognized, null, 2), 'utf8');
-        fs.writeFileSync(path.join(nominationPath, 'votes_unrecognized.json'), JSON.stringify(unrecognized, null, 2), 'utf8');
+        fs.writeFileSync(unrecognizedFile, JSON.stringify(unrecognized, null, 2), 'utf8');
+
+        if (!fs.existsSync(historyDir)) fs.mkdirSync(historyDir, { recursive: true });
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const historyFile = path.join(historyDir, `unrecognized_${timestamp}.json`);
+        fs.copyFileSync(unrecognizedFile, historyFile);
+        console.log(`    Копия unrecognized сохранена: ${historyFile}`);
+
         console.log(`  📊 ${nominationName}: Всего ${originalVotes.length} | ✅ Распознано: ${recognized.length} | ❌ Не распознано: ${unrecognized.length}`);
         if (unrecognized.length > 0) {
-            console.log(`  💡 Совет: если хотите вручную поправить нераспознанные, скопируйте votes.json в votes_with_manual.json, найдите там нераспознанные комментарии, добавьте к ним ключ "withManual": "cleanedText" и отредактируйте поле cleanedText (добавьте туда исправленный текст). Затем запустите меня снова.`);
+            console.log(`  💡 Совет: скопируйте votes.json в votes_with_manual.json, найдите нераспознанные записи, добавьте "withManual": "cleanedText" и исправьте cleanedText, или "notPairs" если пар нет.`);
         }
         return;
     }
 
-    // Ручной файл существует – валидация
+    // --- Ручной файл существует ---
     console.log(`  ${nominationName}: 🕵️‍♂️ Найден votes_with_manual.json. Проверяю честность...`);
     const manualData = JSON.parse(fs.readFileSync(manualFile, 'utf8'));
 
     if (!fs.existsSync(unrecognizedFile)) {
-        console.error(`  ❓ А где votes_unrecognized.json? Сначала запустите скрипт без ручного файла, чтобы он создал этот файл. Потом уже правьте.`);
+        console.error(`  ❓ А где votes_unrecognized.json? Сначала запустите скрипт без ручного файла.`);
         return;
     }
     const prevUnrecognized = JSON.parse(fs.readFileSync(unrecognizedFile, 'utf8'));
+    const originalUnrecognized = JSON.parse(JSON.stringify(prevUnrecognized));
 
     if (!validateManualFile(manualData, originalVotes, prevUnrecognized)) {
-        console.error(`  🔥 ВАЛИДАЦИЯ ПРОВАЛЕНА! Пары не будут извлечены. Исправьте votes_with_manual.json, не жульничайте.`);
+        console.error(`  🔥 ВАЛИДАЦИЯ ПРОВАЛЕНА! Пары не будут извлечены. Исправьте votes_with_manual.json.`);
         return;
     }
 
-    console.log(`  ✅ Валидация успешна! Вы честный человек (или просто хорошо жульничаете, но я не заметил 😜). Запускаю распознавание с учётом ваших правок.`);
+    console.log(`  ✅ Валидация успешна! Запускаю распознавание с учётом ваших правок.`);
 
-    // Собираем массив для парсинга: для записей с флагом берём cleanedText как текст для парсинга, для остальных – оригинальный cleanedText или text
+    // Подготовка данных для парсинга (для notPairs текст не важен)
     const votesToParse = manualData.map(v => {
         if (v.withManual === 'cleanedText') {
-            // Используем исправленный очищенный текст
             return { ...v, textForParsing: v.cleanedText };
         } else {
-            return { ...v, textForParsing: v.cleanedText || v.originalText };
+            return { ...v, textForParsing: v.cleanedText || v.text };
         }
     });
 
@@ -235,8 +264,8 @@ function processNomination(nominationPath, nominationName) {
     const unrecognizedOut = [];
 
     for (const vote of votesToParse) {
-        if (vote.withManual === 'noPairs' || vote.withManual === 'notPairs') {
-            // Игнорируем такой комментарий — не добавляем ни в recognized, ни в unrecognized
+        // Пропускаем помеченные notPairs / noPairs
+        if (vote.withManual === 'notPairs' || vote.withManual === 'noPairs') {
             continue;
         }
         const textForParsing = vote.textForParsing;
@@ -259,7 +288,7 @@ function processNomination(nominationPath, nominationName) {
                 userId: vote.userId,
                 username: vote.username,
                 timestamp: vote.timestamp,
-                originalText: vote.originalText,
+                originalText: vote.text,
                 cleanedText: vote.cleanedText,
                 pairs: uniquePairs,
                 manualFixed: !!vote.withManual
@@ -269,16 +298,43 @@ function processNomination(nominationPath, nominationName) {
                 userId: vote.userId,
                 username: vote.username,
                 timestamp: vote.timestamp,
-                originalText: vote.originalText,
+                originalText: vote.text,
                 cleanedText: vote.cleanedText
             });
         }
     }
 
     fs.writeFileSync(path.join(nominationPath, 'votes_with_pairs.json'), JSON.stringify(recognized, null, 2), 'utf8');
-    fs.writeFileSync(path.join(nominationPath, 'votes_unrecognized.json'), JSON.stringify(unrecognizedOut, null, 2), 'utf8');
+    fs.writeFileSync(unrecognizedFile, JSON.stringify(unrecognizedOut, null, 2), 'utf8');
 
-    console.log(`  📈 ${nominationName}: Всего ${votesToParse.length} | ✅ Распознано: ${recognized.length} | ❌ Не распознано: ${unrecognizedOut.length}`);
+    // --- Сохранение истории и лога решённых записей ---
+    if (!fs.existsSync(historyDir)) fs.mkdirSync(historyDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const historyFile = path.join(historyDir, `unrecognized_${timestamp}.json`);
+    fs.copyFileSync(unrecognizedFile, historyFile);
+    console.log(`    Копия unrecognized сохранена: ${historyFile}`);
+
+    const resolved = originalUnrecognized.filter(old =>
+        !unrecognizedOut.some(newItem => newItem.userId === old.userId && newItem.timestamp === old.timestamp)
+    );
+    if (resolved.length > 0) {
+        const resolvedLogFile = path.join(nominationPath, 'resolved_unrecognized.json');
+        let log = [];
+        if (fs.existsSync(resolvedLogFile)) {
+            log = JSON.parse(fs.readFileSync(resolvedLogFile, 'utf8'));
+        }
+        log.push({
+            timestamp: new Date().toISOString(),
+            resolvedCount: resolved.length,
+            resolvedItems: resolved
+        });
+        fs.writeFileSync(resolvedLogFile, JSON.stringify(log, null, 2), 'utf8');
+        console.log(`    👏 Исправлено нераспознанных комментариев: ${resolved.length}. Лог: ${resolvedLogFile}`);
+    }
+
+    const totalProcessed = votesToParse.filter(v => v.withManual !== 'notPairs' && v.withManual !== 'noPairs').length;
+    console.log(`  📈 ${nominationName}: Всего обработано (исключая notPairs): ${totalProcessed}`);
+    console.log(`      Распознано: ${recognized.length}, не распознано: ${unrecognizedOut.length}`);
     if (unrecognizedOut.length === 0) {
         console.log(`  🎉 Отлично! Все комментарии удалось распознать. Можете праздновать! 🥳`);
     } else {
@@ -286,12 +342,12 @@ function processNomination(nominationPath, nominationName) {
     }
 }
 
-// --------------------------------------------------------------
-// Главная функция
-// --------------------------------------------------------------
+// ------------------------------------------------------------------
+// 7. Главная функция
+// ------------------------------------------------------------------
 function main() {
     if (!fs.existsSync(OUTPUT_BASE)) {
-        console.error(`📂 Папка ${OUTPUT_BASE} не найдена. Сначала запустите parseVotes.js, чтобы создать структуру.`);
+        console.error(`📂 Папка ${OUTPUT_BASE} не найдена. Сначала запустите parseVotes.js.`);
         process.exit(1);
     }
 
@@ -301,7 +357,7 @@ function main() {
     });
 
     if (nominations.length === 0) {
-        console.log(`😴 Нет папок номинаций в ${OUTPUT_BASE}. Запустите parseVotes.js, чтобы обработать сырые данные.`);
+        console.log(`😴 Нет папок номинаций в ${OUTPUT_BASE}. Запустите parseVotes.js.`);
         return;
     }
 
@@ -311,7 +367,7 @@ function main() {
         processNomination(nomPath, nom);
         console.log('');
     }
-    console.log('🏁 Работа завершена. Если остались нераспознанные комментарии, создайте votes_with_manual.json и поправьте cleanedText. Удачи! 🍀');
+    console.log('🏁 Работа завершена.');
 }
 
 main();
