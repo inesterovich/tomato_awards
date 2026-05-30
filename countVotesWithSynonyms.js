@@ -3,30 +3,53 @@ const path = require('path');
 const { buildSurnameMap, normalizePair } = require('./pairNormalizer.js');
 
 const OUTPUT_BASE = './output';
+const CONFIG_FILE = './contest_config.json';
 
-function processNomination(nominationPath, nominationName) {
+function loadConfig() {
+    if (!fs.existsSync(CONFIG_FILE)) {
+        console.error(`❌ Файл конфигурации ${CONFIG_FILE} не найден. Запустите сначала parseVotes.js.`);
+        process.exit(1);
+    }
+    try {
+        return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    } catch (err) {
+        console.error(`❌ Ошибка чтения ${CONFIG_FILE}:`, err.message);
+        process.exit(1);
+    }
+}
+
+function processNomination(nominationPath, nominationName, globalConfig) {
     const pairsFile = path.join(nominationPath, 'votes_with_pairs.json');
     const synonymsFile = path.join(nominationPath, 'synonyms.json');
     const uniquePairsFile = path.join(nominationPath, 'unique_pairs.json');
 
+    // Проверка наличия файлов
     if (!fs.existsSync(pairsFile)) {
         console.log(`  ${nominationName}: votes_with_pairs.json не найден, пропускаем`);
         return;
     }
     if (!fs.existsSync(synonymsFile)) {
         console.error(`  ${nominationName}: Файл synonyms.json не найден. Сначала создайте его вручную на основе unique_pairs.json`);
-        return;
+        process.exit(1);
     }
     if (!fs.existsSync(uniquePairsFile)) {
         console.error(`  ${nominationName}: unique_pairs.json не найден. Сначала запустите extractUniquePairs.js`);
-        return;
+        process.exit(1);
     }
+
+    // Проверка наличия номинации в конфиге
+    const nomConfig = globalConfig[nominationName];
+    if (!nomConfig) {
+        console.error(`  ${nominationName}: нет записи в ${CONFIG_FILE}. Невозможно подсчитать голоса.`);
+        process.exit(1);
+    }
+    const limit = nomConfig.limit;
 
     const votesData = JSON.parse(fs.readFileSync(pairsFile, 'utf8'));
     const synonyms = JSON.parse(fs.readFileSync(synonymsFile, 'utf8'));
     const uniquePairs = JSON.parse(fs.readFileSync(uniquePairsFile, 'utf8'));
 
-    // Строим карту вариант → каноническая пара (включая сам canonical)
+    // Строим карту вариант → каноническая пара
     const variantToCanonical = new Map();
     for (const group of synonyms) {
         if (!group.canonical || !group.variants || !Array.isArray(group.variants)) {
@@ -43,7 +66,7 @@ function processNomination(nominationPath, nominationName) {
         }
     }
 
-    // Проверка покрытия: каждый canonical из unique_pairs.json должен присутствовать как вариант или как canonical
+    // Проверка покрытия unique_pairs.json
     const uncovered = [];
     for (const item of uniquePairs) {
         const canonicalFromFile = item.canonical;
@@ -56,14 +79,12 @@ function processNomination(nominationPath, nominationName) {
         fs.writeFileSync(outUncovered, JSON.stringify(uncovered, null, 2), 'utf8');
         console.error(`  ${nominationName}: ❌ Найдено ${uncovered.length} вариантов из unique_pairs.json, которые не покрыты synonyms.json.`);
         console.error(`     Сохранено в ${outUncovered}. Добавьте их в synonyms.json (как канонические или варианты).`);
-        return;
+        process.exit(1);
     }
 
-    // Строим карту фамилий (для нормализации)
     const surnameMap = buildSurnameMap(votesData);
+    const userVotesMap = new Map(); // userId → массив голосов
 
-    // Группировка голосов по пользователям
-    const userVotesMap = new Map();
     for (const vote of votesData) {
         if (!vote.pairs || vote.pairs.length === 0) continue;
         const userId = vote.userId;
@@ -88,12 +109,12 @@ function processNomination(nominationPath, nominationName) {
         }
     }
 
-    // Лимит 3 голоса на пользователя
+    // Применяем лимит для номинации
     const allVotes = [];
     for (const [userId, items] of userVotesMap.entries()) {
         items.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-        const counted = items.slice(0, 3);
-        const uncounted = items.slice(3);
+        const counted = items.slice(0, limit);
+        const uncounted = items.slice(limit);
         for (const item of counted) allVotes.push({ ...item, counted: true });
         for (const item of uncounted) allVotes.push({ ...item, counted: false });
     }
@@ -127,6 +148,7 @@ function processNomination(nominationPath, nominationName) {
     const outFile = path.join(nominationPath, 'votes_results.json');
     fs.writeFileSync(outFile, JSON.stringify({
         nomination: nominationName,
+        vote_limit: limit,
         total_unique_voters: userVotesMap.size,
         total_votes_submitted: allVotes.length,
         total_votes_counted: allVotes.filter(v => v.counted).length,
@@ -135,9 +157,10 @@ function processNomination(nominationPath, nominationName) {
     }, null, 2), 'utf8');
 
     console.log(`  ${nominationName}:`);
+    console.log(`    Лимит голосов на пользователя: ${limit}`);
     console.log(`    Уникальных пользователей: ${userVotesMap.size}`);
     console.log(`    Всего голосов (после маппинга): ${allVotes.length}`);
-    console.log(`    Зачтено: ${allVotes.filter(v => v.counted).length}, отклонено (лимит 3): ${allVotes.filter(v => !v.counted).length}`);
+    console.log(`    Зачтено: ${allVotes.filter(v => v.counted).length}, отклонено (лимит): ${allVotes.filter(v => !v.counted).length}`);
     console.log(`    Уникальных пар: ${results.length}`);
     console.log(`    Результат сохранён в ${outFile}`);
 }
@@ -147,18 +170,22 @@ function main() {
         console.error(`Папка ${OUTPUT_BASE} не существует. Сначала запустите parseVotes.js и extractPairs.js`);
         process.exit(1);
     }
+
+    const globalConfig = loadConfig();
     const nominations = fs.readdirSync(OUTPUT_BASE).filter(item => {
         const itemPath = path.join(OUTPUT_BASE, item);
         return fs.statSync(itemPath).isDirectory();
     });
+
     if (nominations.length === 0) {
         console.log(`Нет папок номинаций в ${OUTPUT_BASE}`);
         return;
     }
+
     console.log(`Найдено номинаций: ${nominations.length}\n`);
     for (const nom of nominations) {
         const nomPath = path.join(OUTPUT_BASE, nom);
-        processNomination(nomPath, nom);
+        processNomination(nomPath, nom, globalConfig);
         console.log('');
     }
     console.log('Готово!');

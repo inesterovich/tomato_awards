@@ -1,0 +1,22 @@
+{
+  "best_pair_C": {
+    "name": "Лучшая пара С-класса",
+    "limit": 3,
+    "type": "pair"
+  },
+  "best_pair_D": {
+    "name": "Лучшая пара D-класса",
+    "limit": 3,
+    "type": "pair"
+  },
+  "pair_of_year": {
+    "name": "Пара года",
+    "limit": 3,
+    "type": "pair"
+  },
+  "routine_of_the_year": {
+    "name": "Рутина года",
+    "limit": 3,
+    "type": "pair"
+  }
+}

@@ -1,5 +1,6 @@
 {
   "nomination": "routine_of_the_year",
+  "vote_limit": 3,
   "total_unique_voters": 417,
   "total_votes_submitted": 549,
   "total_votes_counted": 548,

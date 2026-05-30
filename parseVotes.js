@@ -3,8 +3,10 @@ const path = require('path');
 
 const INPUT_DIR = './input';
 const OUTPUT_BASE = './output';
+const CONFIG_FILE = './contest_config.json';
+const SUPPORTED_TYPES = ['pair']; // в будущем можно добавить 'single', 'reg_club', 'event'
 
-// Удаление эмодзи (сохраняем переносы строк, плюсы, тире)
+// Удаление эмодзи
 function removeEmojis(text) {
     return text.replace(/\p{Extended_Pictographic}/gu, '').trim();
 }
@@ -40,19 +42,48 @@ function isAddition(text, lengthLimit = 200) {
     return false;
 }
 
-// Обработка одного файла номинации
-function processNomination(filePath, nominationName) {
+// Загрузка глобального конфига
+function loadConfig() {
+    if (!fs.existsSync(CONFIG_FILE)) {
+        console.error(`❌ Ошибка: не найден файл конфигурации ${CONFIG_FILE}.`);
+        console.error(`Создайте его в корневой папке. Пример:`);
+        console.error(JSON.stringify({
+            "Лучшая пара": { "name": "Лучшая танцевальная пара", "limit": 3, "type": "pair" }
+        }, null, 2));
+        process.exit(1);
+    }
+    try {
+        return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    } catch (err) {
+        console.error(`❌ Ошибка чтения ${CONFIG_FILE}:`, err.message);
+        process.exit(1);
+    }
+}
+
+// Обработка одной номинации
+function processNomination(filePath, nominationName, config) {
     console.log(`\nОбработка номинации: ${nominationName}`);
+
+    // Проверка наличия в конфиге
+    const nomConfig = config[nominationName];
+    if (!nomConfig) {
+        console.warn(`  ⚠️ Номинация "${nominationName}" не описана в ${CONFIG_FILE}. Пропускаем.`);
+        return false;
+    }
+    if (!SUPPORTED_TYPES.includes(nomConfig.type)) {
+        console.warn(`  ⚠️ Номинация "${nominationName}" имеет тип "${nomConfig.type}", который пока не поддерживается. Пропускаем.`);
+        return false;
+    }
 
     let comments;
     try {
         comments = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     } catch (err) {
         console.error(`  Ошибка чтения файла ${filePath}: ${err.message}`);
-        return;
+        return false;
     }
 
-    // Добавляем очищенное поле
+    // Очистка от эмодзи
     for (const comment of comments) {
         comment.cleanedRawText = removeEmojis(comment.text);
     }
@@ -70,7 +101,6 @@ function processNomination(filePath, nominationName) {
     const additions = [];
     const other = [];
 
-    // Категоризация с приоритетом дополнений
     comments.forEach(c => {
         const cleaned = c.cleanedRawText;
         if (c.isReply && isAddition(cleaned)) {
@@ -111,9 +141,12 @@ function processNomination(filePath, nominationName) {
     console.log(`  Дополнений: ${additions.length}`);
     console.log(`  Прочих: ${other.length}`);
     console.log(`  Результаты сохранены в: ${outDir}`);
+    return true;
 }
 
 function main() {
+    const config = loadConfig();
+
     if (!fs.existsSync(INPUT_DIR)) {
         console.error(`Ошибка: входная папка "${INPUT_DIR}" не существует.`);
         process.exit(1);
@@ -125,12 +158,16 @@ function main() {
     }
     console.log(`Найдено ${files.length} JSON-файлов:`);
     files.forEach(f => console.log(`  - ${f}`));
+
+    let processed = 0;
     for (const file of files) {
         const nominationName = path.basename(file, '.json');
         const fullPath = path.join(INPUT_DIR, file);
-        processNomination(fullPath, nominationName);
+        const ok = processNomination(fullPath, nominationName, config);
+        if (ok) processed++;
     }
-    console.log('\nГотово!');
+    console.log(`\nОбработано номинаций: ${processed} из ${files.length}`);
+    console.log('Готово!');
 }
 
 main();
