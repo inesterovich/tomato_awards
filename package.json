@@ -1,0 +1,24 @@
+{
+  "name": "tomato-awards",
+  "version": "1.0.0",
+  "description": "Автоматическая обработка комментариев, извлечение пар и подсчёт результатов с возможностью ручной корректировки.   Создан для организаторов конкурсов, которые хотят прозрачно и быстро подвести итоги голосования в соцсетях (например, ВКонтакте).",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inesterovich/tomato_awards.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/inesterovich/tomato_awards/issues"
+  },
+  "homepage": "https://github.com/inesterovich/tomato_awards#readme",
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "fuse.js": "^7.3.0",
+    "leven": "^4.1.0"
+  }
+}
